@@ -70,6 +70,47 @@ def _clamp01(val: float) -> float:
     return float(max(0.0, min(1.0, round(val, 6))))
 
 
+def _estimate_staff_spacing_strip_ac(gray: np.ndarray) -> float:
+    """Estimate staff-line spacing (px) via vertical second-derivative strip autocorrelation."""
+    h, w = gray.shape[:2]
+    line_resp = np.zeros_like(gray, dtype=np.float32)
+    for d in (1, 2, 3):
+        if h <= 2 * d:
+            continue
+        resp = (
+            0.5 * (gray[:-2 * d, :].astype(np.float32) + gray[2 * d :, :].astype(np.float32))
+            - gray[d:-d, :].astype(np.float32)
+        )
+        line_resp[d:-d, :] = np.maximum(line_resp[d:-d, :], np.maximum(0.0, resp))
+
+    n_strips = 8
+    x0, x1 = int(w * 0.12), int(w * 0.88)
+    strip_w = max(8, (x1 - x0) // n_strips)
+    max_lag = min(36, max(16, h // 12))
+    ac = np.zeros(max_lag + 1, dtype=np.float64)
+
+    for s in range(n_strips):
+        sx0 = x0 + s * strip_w
+        sx1 = min(w, sx0 + strip_w)
+        if sx1 <= sx0:
+            continue
+        prof = np.mean(line_resp[:, sx0:sx1], axis=1)
+        prof = prof - np.mean(prof)
+        for lag in range(4, max_lag + 1):
+            ac[lag] += float(np.sum(prof[:-lag] * prof[lag:]))
+
+    if np.max(ac[4:]) <= 0.0:
+        return 12.0
+
+    best_lag = 4 + int(np.argmax(ac[4:]))
+    if 4 < best_lag < max_lag:
+        y_m1, y_0, y_p1 = ac[best_lag - 1], ac[best_lag], ac[best_lag + 1]
+        denom = y_m1 - 2.0 * y_0 + y_p1
+        delta = 0.5 * (y_m1 - y_p1) / denom if abs(denom) > 1e-9 else 0.0
+        return float(best_lag + max(-0.5, min(0.5, delta)))
+    return float(best_lag)
+
+
 def detect_staff_and_measure_boxes_opencv(img_bgr: np.ndarray) -> tuple[float, List[BoundingBoxItem]]:
     """Detect staff-line spacing, staff systems, and measure bounding boxes via OpenCV morphology."""
     if img_bgr.ndim == 3:
@@ -120,16 +161,15 @@ def detect_staff_and_measure_boxes_opencv(img_bgr: np.ndarray) -> tuple[float, L
                 prev = r
         line_centers.append(0.5 * (start + prev))
 
-    # Estimate staff spacing from adjacent line center diffs
-    staff_spacing_px = 12.0
-    if len(line_centers) >= 2:
+    # Estimate staff spacing from strip autocorrelation, refined by clean morphological line diffs when available
+    staff_spacing_px = _estimate_staff_spacing_strip_ac(gray)
+    if len(line_centers) >= 8:
         diffs = np.diff(line_centers)
-        plausible = diffs[(diffs >= 3.0) & (diffs <= max(60.0, h * 0.05))]
-        if len(plausible) > 0:
-            hist, bin_edges = np.histogram(plausible, bins=max(5, int(np.ptp(plausible)) + 1))
-            best_bin = int(np.argmax(hist))
-            in_bin = plausible[(plausible >= bin_edges[best_bin]) & (plausible <= bin_edges[best_bin + 1] + 1.0)]
-            staff_spacing_px = float(np.median(in_bin)) if len(in_bin) > 0 else float(np.median(plausible))
+        plausible = diffs[(diffs >= 4.0) & (diffs <= max(60.0, h * 0.05))]
+        if len(plausible) >= 6:
+            med_diff = float(np.median(plausible))
+            if abs(med_diff - staff_spacing_px) <= 3.0:
+                staff_spacing_px = med_diff
 
     # Group line centers into staves (groups of ~5 lines separated by ~staff_spacing_px)
     staves: List[tuple[int, int]] = []
@@ -151,6 +191,31 @@ def detect_staff_and_measure_boxes_opencv(img_bgr: np.ndarray) -> tuple[float, L
             y1 = min(h - 1, int(round(curr_group[-1] + staff_spacing_px * 0.5)))
             if y1 > y0:
                 staves.append((y0, y1))
+
+    # Fallback to 5-line comb filter when camera skew prevents full-width horizontal morphology
+    if len(staves) < 2:
+        sp_int = max(4, int(round(staff_spacing_px)))
+        line_resp = np.zeros_like(gray, dtype=np.float32)
+        for d in (1, 2, 3):
+            if h > 2 * d:
+                resp = (
+                    0.5 * (gray[:-2 * d, :].astype(np.float32) + gray[2 * d :, :].astype(np.float32))
+                    - gray[d:-d, :].astype(np.float32)
+                )
+                line_resp[d:-d, :] = np.maximum(line_resp[d:-d, :], np.maximum(0.0, resp))
+        prof = np.mean(line_resp[:, int(w * 0.2) : int(w * 0.8)], axis=1)
+        comb = np.zeros(h, dtype=np.float32)
+        for k in (-2, -1, 0, 1, 2):
+            comb += np.roll(prof, k * sp_int)
+        min_dist = max(18, int(staff_spacing_px * 6.0))
+        half_staff = max(6, int(round(staff_spacing_px * 2.2)))
+        staves = []
+        for y in range(half_staff + 4, h - half_staff - 4):
+            w0 = max(0, y - min_dist // 2)
+            w1 = min(h, y + min_dist // 2 + 1)
+            if comb[y] > np.mean(comb) * 1.15 and comb[y] >= np.max(comb[w0:w1]):
+                if not staves or (y - half_staff - staves[-1][0]) >= min_dist:
+                    staves.append((max(0, y - half_staff), min(h - 1, y + half_staff)))
 
     if not staves:
         return round(staff_spacing_px, 2), [
