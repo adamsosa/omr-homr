@@ -1,28 +1,44 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""FastAPI HTTP wrapper around homr CLI subprocess with OpenCV staff/barline fallback."""
+"""FastAPI HTTP wrapper around homr CLI subprocess with OpenCV measure-box extraction."""
 
 from __future__ import annotations
 
+import io
 import json
 import os
 import pathlib
 import shutil
 import subprocess
 import tempfile
+import time
 from typing import Any
 
 import cv2
 import numpy as np
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, Header, HTTPException, UploadFile
+from fastapi.concurrency import run_in_threadpool
+from fastapi.responses import JSONResponse
+from PIL import Image
 from pydantic import BaseModel, Field
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
+MAX_UPLOAD_BYTES = 4 * 1024 * 1024
+MAX_DIMENSION_PX = 8000
+MAX_TOTAL_PIXELS = 25_000_000
 
 app = FastAPI(
     title="omr-homr Service",
     version="1.0.0",
     description="Isolated AGPL-3.0 Optical Music Recognition service wrapping homr CLI subprocess.",
 )
+
+
+class OMREngineUnavailableError(RuntimeError):
+    """Raised when the homr CLI binary is missing or exits non-zero."""
+
+
+class OMREngineTimeoutError(TimeoutError):
+    """Raised when the homr CLI subprocess exceeds the request deadline."""
 
 
 class BoundingBoxItem(BaseModel):
@@ -39,7 +55,7 @@ class OMRResponse(BaseModel):
     musicxml: str
     measure_boxes: list[BoundingBoxItem]
     staff_spacing_px: float
-    engine: str = "opencv-fallback"
+    engine: str = "homr-cli"
 
 
 class SourceResponse(BaseModel):
@@ -335,112 +351,26 @@ def detect_staff_and_measure_boxes_opencv(
     return round(staff_spacing_px, 2), (measure_boxes or _default_single_box())
 
 
-def build_fallback_musicxml(measure_boxes: list[BoundingBoxItem]) -> str:
-    """Synthesize a valid MusicXML 4.0 score matching the detected measure and staff structure."""
-    num_measures = max(1, len(measure_boxes))
-    first_staves = (
-        len(measure_boxes[0].staff_boxes) if measure_boxes and measure_boxes[0].staff_boxes else 3
-    )
-    has_vocal = first_staves >= 3
-
-    vocal_measures_xml: list[str] = []
-    piano_measures_xml: list[str] = []
-    pitches_vocal = [("C", 5), ("D", 5), ("E", 5), ("G", 4)]
-    pitches_rh = [("E", 4), ("F", 4), ("G", 4), ("C", 4)]
-    pitches_lh = [("C", 3), ("G", 2), ("A", 2), ("F", 2)]
-
-    for idx in range(num_measures):
-        m_num = idx + 1
-        v_step, v_oct = pitches_vocal[idx % len(pitches_vocal)]
-        rh_step, rh_oct = pitches_rh[idx % len(pitches_rh)]
-        lh_step, lh_oct = pitches_lh[idx % len(pitches_lh)]
-
-        if has_vocal:
-            v_attr = (
-                "      <attributes>\n"
-                "        <divisions>4</divisions>\n"
-                "        <key><fifths>0</fifths><mode>major</mode></key>\n"
-                "        <time><beats>4</beats><beat-type>4</beat-type></time>\n"
-                "        <clef><sign>G</sign><line>2</line></clef>\n"
-                "      </attributes>\n"
-                if idx == 0
-                else ""
-            )
-            vocal_measures_xml.append(
-                f'    <measure number="{m_num}">\n'
-                f"{v_attr}"
-                f"      <note>\n"
-                f"        <pitch><step>{v_step}</step><octave>{v_oct}</octave></pitch>\n"
-                f"        <duration>16</duration>\n"
-                f"        <voice>1</voice>\n"
-                f"        <type>whole</type>\n"
-                f"      </note>\n"
-                f"    </measure>"
-            )
-
-        p_attr = (
-            "      <attributes>\n"
-            "        <divisions>4</divisions>\n"
-            "        <key><fifths>0</fifths><mode>major</mode></key>\n"
-            "        <time><beats>4</beats><beat-type>4</beat-type></time>\n"
-            "        <staves>2</staves>\n"
-            '        <clef number="1"><sign>G</sign><line>2</line></clef>\n'
-            '        <clef number="2"><sign>F</sign><line>4</line></clef>\n'
-            "      </attributes>\n"
-            if idx == 0
-            else ""
-        )
-        piano_measures_xml.append(
-            f'    <measure number="{m_num}">\n'
-            f"{p_attr}"
-            f"      <note>\n"
-            f"        <pitch><step>{rh_step}</step><octave>{rh_oct}</octave></pitch>\n"
-            f"        <duration>16</duration>\n"
-            f"        <voice>1</voice>\n"
-            f"        <type>whole</type>\n"
-            f"        <staff>1</staff>\n"
-            f"      </note>\n"
-            f"      <backup><duration>16</duration></backup>\n"
-            f"      <note>\n"
-            f"        <pitch><step>{lh_step}</step><octave>{lh_oct}</octave></pitch>\n"
-            f"        <duration>16</duration>\n"
-            f"        <voice>5</voice>\n"
-            f"        <type>whole</type>\n"
-            f"        <staff>2</staff>\n"
-            f"      </note>\n"
-            f"    </measure>"
+def _validate_image_dimensions(image_bytes: bytes) -> None:
+    try:
+        with Image.open(io.BytesIO(image_bytes)) as pil_img:
+            width, height = pil_img.size
+    except Exception as exc:
+        raise ValueError("Unable to read image header") from exc
+    if width <= 0 or height <= 0:
+        raise ValueError("Invalid non-positive image dimensions")
+    if (
+        width > MAX_DIMENSION_PX
+        or height > MAX_DIMENSION_PX
+        or (width * height) > MAX_TOTAL_PIXELS
+    ):
+        raise ValueError(
+            f"Image dimensions {width}x{height} exceed safety limit ({MAX_DIMENSION_PX}px / {MAX_TOTAL_PIXELS} pixels)"
         )
 
-    if has_vocal:
-        parts_list_xml = (
-            '    <score-part id="P1"><part-name>Voice</part-name></score-part>\n'
-            '    <score-part id="P2"><part-name>Piano</part-name></score-part>'
-        )
-        parts_body_xml = (
-            '  <part id="P1">\n'
-            + "\n".join(vocal_measures_xml)
-            + '\n  </part>\n  <part id="P2">\n'
-            + "\n".join(piano_measures_xml)
-            + "\n  </part>"
-        )
-    else:
-        parts_list_xml = '    <score-part id="P1"><part-name>Piano</part-name></score-part>'
-        parts_body_xml = '  <part id="P1">\n' + "\n".join(piano_measures_xml) + "\n  </part>"
 
-    return (
-        '<?xml version="1.0" encoding="UTF-8"?>\n'
-        '<!DOCTYPE score-partwise PUBLIC "-//Recordare//DTD MusicXML 4.0 Partwise//EN" '
-        '"http://www.musicxml.org/dtds/partwise.dtd">\n'
-        '<score-partwise version="4.0">\n'
-        "  <part-list>\n"
-        f"{parts_list_xml}\n"
-        "  </part-list>\n"
-        f"{parts_body_xml}\n"
-        "</score-partwise>\n"
-    )
-
-
-def run_omr_on_image_bytes(image_bytes: bytes) -> OMRResponse:
+def run_omr_on_image_bytes(image_bytes: bytes, timeout_s: float = 115.0) -> OMRResponse:
+    _validate_image_dimensions(image_bytes)
     arr = np.frombuffer(image_bytes, dtype=np.uint8)
     img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
     if img is None:
@@ -448,51 +378,53 @@ def run_omr_on_image_bytes(image_bytes: bytes) -> OMRResponse:
 
     staff_spacing_px, opencv_boxes = detect_staff_and_measure_boxes_opencv(img)
     homr_bin = shutil.which("homr")
-    force_fallback = os.environ.get("OMR_FORCE_FALLBACK", "0") == "1"
+    if not homr_bin:
+        raise OMREngineUnavailableError(
+            "homr CLI binary is not installed on PATH; refusing to return fabricated MusicXML"
+        )
 
-    if homr_bin and not force_fallback:
-        with tempfile.TemporaryDirectory(prefix="omr_homr_") as tmpdir:
-            tmp_path = pathlib.Path(tmpdir)
-            img_path = tmp_path / "page.png"
-            cv2.imwrite(str(img_path), img)
+    with tempfile.TemporaryDirectory(prefix="omr_homr_") as tmpdir:
+        tmp_path = pathlib.Path(tmpdir)
+        img_path = tmp_path / "page.png"
+        cv2.imwrite(str(img_path), img)
+        try:
             proc = subprocess.run(
                 [homr_bin, str(img_path)],
                 cwd=tmpdir,
                 capture_output=True,
                 text=True,
                 check=False,
-                timeout=120.0,
+                timeout=max(1.0, min(118.0, timeout_s)),
             )
-            xml_candidates = list(tmp_path.glob("*.musicxml")) + list(tmp_path.glob("*.xml"))
-            if proc.returncode == 0 and xml_candidates:
-                musicxml_str = xml_candidates[0].read_text(encoding="utf-8")
-                boxes_file = img_path.with_suffix(".boxes.json")
-                if boxes_file.exists():
-                    raw_boxes: dict[str, Any] = json.loads(boxes_file.read_text(encoding="utf-8"))
-                    parsed_boxes = [
-                        BoundingBoxItem.model_validate(b)
-                        for b in raw_boxes.get("measure_boxes", [])
-                    ]
-                    spacing = float(raw_boxes.get("staff_spacing_px", staff_spacing_px))
-                    return OMRResponse(
-                        musicxml=musicxml_str,
-                        measure_boxes=parsed_boxes or opencv_boxes,
-                        staff_spacing_px=spacing,
-                        engine="homr-cli",
-                    )
-                return OMRResponse(
-                    musicxml=musicxml_str,
-                    measure_boxes=opencv_boxes,
-                    staff_spacing_px=staff_spacing_px,
-                    engine="homr-cli",
-                )
+        except subprocess.TimeoutExpired as exc:
+            raise OMREngineTimeoutError("homr CLI subprocess timed out") from exc
 
-    return OMRResponse(
-        musicxml=build_fallback_musicxml(opencv_boxes),
-        measure_boxes=opencv_boxes,
-        staff_spacing_px=staff_spacing_px,
-        engine="opencv-fallback",
-    )
+        xml_candidates = list(tmp_path.glob("*.musicxml")) + list(tmp_path.glob("*.xml"))
+        if proc.returncode != 0 or not xml_candidates:
+            raise OMREngineUnavailableError(
+                f"homr CLI failed with exit code {proc.returncode} (xml_files={len(xml_candidates)})"
+            )
+
+        musicxml_str = xml_candidates[0].read_text(encoding="utf-8")
+        boxes_file = img_path.with_suffix(".boxes.json")
+        if boxes_file.exists():
+            raw_boxes: dict[str, Any] = json.loads(boxes_file.read_text(encoding="utf-8"))
+            parsed_boxes = [
+                BoundingBoxItem.model_validate(b) for b in raw_boxes.get("measure_boxes", [])
+            ]
+            spacing = float(raw_boxes.get("staff_spacing_px", staff_spacing_px))
+            return OMRResponse(
+                musicxml=musicxml_str,
+                measure_boxes=parsed_boxes or opencv_boxes,
+                staff_spacing_px=spacing,
+                engine="homr-cli",
+            )
+        return OMRResponse(
+            musicxml=musicxml_str,
+            measure_boxes=opencv_boxes,
+            staff_spacing_px=staff_spacing_px,
+            engine="homr-cli",
+        )
 
 
 @app.get("/health")
@@ -509,12 +441,63 @@ def get_source() -> SourceResponse:
     )
 
 
+def _compute_deadline_timeout(x_request_deadline: str | None) -> float:
+    if not x_request_deadline:
+        return 115.0
+    try:
+        deadline_epoch = float(x_request_deadline)
+        remaining = deadline_epoch - time.time() - 2.0
+        return max(1.0, min(115.0, remaining))
+    except ValueError:
+        return 115.0
+
+
 @app.post("/omr", response_model=OMRResponse)
-async def post_omr(image: UploadFile = File(...)) -> OMRResponse:
+async def post_omr(
+    image: UploadFile = File(...),
+    x_request_deadline: str | None = Header(default=None),
+) -> OMRResponse | JSONResponse:
     raw_bytes = await image.read()
     if not raw_bytes:
         raise HTTPException(status_code=400, detail="Empty image payload")
+    if len(raw_bytes) > MAX_UPLOAD_BYTES:
+        return JSONResponse(
+            status_code=413,
+            content={
+                "error_code": "IMAGE_TOO_LARGE",
+                "message": "Image exceeds 4 MB upload limit",
+                "retryable": False,
+            },
+        )
+    timeout_s = _compute_deadline_timeout(x_request_deadline)
     try:
-        return run_omr_on_image_bytes(raw_bytes)
-    except ValueError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return await run_in_threadpool(run_omr_on_image_bytes, raw_bytes, timeout_s)
+    except ValueError:
+        return JSONResponse(
+            status_code=422,
+            content={
+                "error_code": "INVALID_IMAGE",
+                "message": "Invalid image format or dimensions exceeded",
+                "retryable": False,
+            },
+        )
+    except OMREngineTimeoutError:
+        return JSONResponse(
+            status_code=504,
+            headers={"Retry-After": "5"},
+            content={
+                "error_code": "OMR_UPSTREAM_TIMEOUT",
+                "message": "homr OMR subprocess timed out",
+                "retryable": True,
+            },
+        )
+    except OMREngineUnavailableError:
+        return JSONResponse(
+            status_code=503,
+            headers={"Retry-After": "5"},
+            content={
+                "error_code": "OMR_ENGINE_UNAVAILABLE",
+                "message": "homr OMR engine is unavailable or failed",
+                "retryable": True,
+            },
+        )
