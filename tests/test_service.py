@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """Unit tests for the isolated AGPL-3.0 omr-homr FastAPI microservice."""
+
 from __future__ import annotations
 
 import cv2
 import numpy as np
 from fastapi.testclient import TestClient
-
 from omr_homr_service.app import app
 
 client = TestClient(app)
