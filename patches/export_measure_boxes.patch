@@ -1,0 +1,58 @@
+--- a/homr/main.py
++++ b/homr/main.py
+@@ -1,6 +1,7 @@
++import json
+ import os
+ from pathlib import Path
+ from typing import List
+ 
++
++def _export_normalized_measure_boxes(
++    image_path: Path,
++    image_width: int,
++    image_height: int,
++    systems: list,
++    staff_spacing_px: float,
++) -> None:
++    """Export normalized [x, y, w, h] in [0, 1] measure and staff bounding boxes alongside MusicXML."""
++    w_f = float(max(1, image_width))
++    h_f = float(max(1, image_height))
++    measure_boxes = []
++    global_m_idx = 0
++    for sys_idx, system in enumerate(systems):
++        staff_boxes = []
++        for staff in getattr(system, "staves", []):
++            sx, sy, sw, sh = getattr(staff, "bbox", (0, 0, image_width, image_height))
++            staff_boxes.append(
++                {
++                    "x": max(0.0, min(1.0, sx / w_f)),
++                    "y": max(0.0, min(1.0, sy / h_f)),
++                    "w": max(0.0, min(1.0, sw / w_f)),
++                    "h": max(0.0, min(1.0, sh / h_f)),
++                }
++            )
++        for measure in getattr(system, "measures", []):
++            mx, my, mw, mh = getattr(measure, "bbox", (0, 0, image_width, image_height))
++            measure_boxes.append(
++                {
++                    "measure_index": global_m_idx,
++                    "system_index": sys_idx,
++                    "x": max(0.0, min(1.0, mx / w_f)),
++                    "y": max(0.0, min(1.0, my / h_f)),
++                    "w": max(0.0, min(1.0, mw / w_f)),
++                    "h": max(0.0, min(1.0, mh / h_f)),
++                    "staff_boxes": staff_boxes,
++                }
++            )
++            global_m_idx += 1
++    out_path = image_path.with_suffix(".boxes.json")
++    out_path.write_text(
++        json.dumps(
++            {
++                "staff_spacing_px": float(staff_spacing_px),
++                "measure_boxes": measure_boxes,
++            },
++            indent=2,
++        ),
++        encoding="utf-8",
++    )

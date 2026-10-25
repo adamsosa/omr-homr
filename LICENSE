@@ -1,0 +1,18 @@
+GNU AFFERO GENERAL PUBLIC LICENSE
+Version 3, 19 November 2007
+
+Copyright (C) 2007 Free Software Foundation, Inc. <https://fsf.org/>
+Everyone is permitted to copy and distribute verbatim copies
+of this license document, but changing it is not allowed.
+
+This repository (omr-homr) is licensed under the GNU Affero General Public
+License v3.0 only (SPDX-License-Identifier: AGPL-3.0-only).
+
+It wraps and patches `homr` (https://github.com/liebharc/homr, licensed under
+AGPL-3.0) as an isolated HTTP microservice. Pursuant to Section 13 of the
+GNU Affero General Public License v3.0, the Complete Corresponding Source
+Code of this service—including the pinned `homr` revision, bounding-box
+export patch (`patches/export_measure_boxes.patch`), and HTTP wrapper—is
+publicly available at the repository URL returned by `GET /source`.
+
+Full license text: https://www.gnu.org/licenses/agpl-3.0.txt
