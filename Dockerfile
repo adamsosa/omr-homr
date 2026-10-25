@@ -14,17 +14,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN useradd --create-home --shell /bin/bash appuser
 WORKDIR /app
 
-# Install CPU-only PyTorch first to avoid 3 GB CUDA wheels, then pinned homr and FastAPI
-ARG HOMR_VERSION=0.4.0
-RUN pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cpu \
-    torch torchvision && \
-    pip install --no-cache-dir \
+# Install ONNX Runtime and pinned homr 0.7.0 + FastAPI
+ARG HOMR_VERSION=0.7.0
+RUN pip install --no-cache-dir \
     "fastapi==0.115.0" \
     "uvicorn[standard]==0.30.6" \
     "python-multipart==0.0.12" \
-    "pillow==10.4.0" \
-    "numpy==1.26.4" \
-    "opencv-python-headless==4.10.0.84" \
     "homr==${HOMR_VERSION}" && \
     python -c "import homr"
 
