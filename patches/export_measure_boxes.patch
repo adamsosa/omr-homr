@@ -1,58 +1,129 @@
 --- a/homr/main.py
 +++ b/homr/main.py
-@@ -1,6 +1,7 @@
+@@ -1,5 +1,6 @@
+ import argparse
+ import glob
 +import json
  import os
- from pathlib import Path
- from typing import List
+ import sys
+ from concurrent.futures import Future
+@@ -229,6 +230,109 @@
+             debug_cleanup.clean_debug_files_from_previous_runs()
  
-+
+ 
 +def _export_normalized_measure_boxes(
-+    image_path: Path,
-+    image_width: int,
-+    image_height: int,
-+    systems: list,
-+    staff_spacing_px: float,
++    image_path: str,
++    multi_staffs: list[MultiStaff],
++    all_staffs: list,
++    bar_line_boxes: list[RotatedBoundingBox],
++    image_shape: tuple[int, ...],
 +) -> None:
-+    """Export normalized [x, y, w, h] in [0, 1] measure and staff bounding boxes alongside MusicXML."""
-+    w_f = float(max(1, image_width))
-+    h_f = float(max(1, image_height))
++    ih, iw = int(image_shape[0]), int(image_shape[1])
++    if ih <= 0 or iw <= 0:
++        return
 +    measure_boxes = []
 +    global_m_idx = 0
-+    for sys_idx, system in enumerate(systems):
-+        staff_boxes = []
-+        for staff in getattr(system, "staves", []):
-+            sx, sy, sw, sh = getattr(staff, "bbox", (0, 0, image_width, image_height))
-+            staff_boxes.append(
-+                {
-+                    "x": max(0.0, min(1.0, sx / w_f)),
-+                    "y": max(0.0, min(1.0, sy / h_f)),
-+                    "w": max(0.0, min(1.0, sw / w_f)),
-+                    "h": max(0.0, min(1.0, sh / h_f)),
-+                }
-+            )
-+        for measure in getattr(system, "measures", []):
-+            mx, my, mw, mh = getattr(measure, "bbox", (0, 0, image_width, image_height))
-+            measure_boxes.append(
-+                {
-+                    "measure_index": global_m_idx,
-+                    "system_index": sys_idx,
-+                    "x": max(0.0, min(1.0, mx / w_f)),
-+                    "y": max(0.0, min(1.0, my / h_f)),
-+                    "w": max(0.0, min(1.0, mw / w_f)),
-+                    "h": max(0.0, min(1.0, mh / h_f)),
-+                    "staff_boxes": staff_boxes,
-+                }
-+            )
-+            global_m_idx += 1
-+    out_path = image_path.with_suffix(".boxes.json")
-+    out_path.write_text(
-+        json.dumps(
++    all_units = [float(s.average_unit_size) for ms in multi_staffs for s in ms.staffs if s.average_unit_size > 0]
++    page_unit = float(np.median(all_units)) if all_units else 12.0
++
++    for sys_idx, ms in enumerate(multi_staffs):
++        if not ms.staffs:
++            continue
++        sys_x0 = float(min(s.min_x for s in ms.staffs))
++        sys_x1 = float(max(s.max_x for s in ms.staffs))
++        avg_unit = float(sum(s.average_unit_size for s in ms.staffs) / len(ms.staffs))
++        sys_y0_raw = float(min(s.min_y for s in ms.staffs))
++        sys_y1_raw = float(max(s.max_y for s in ms.staffs))
++        sys_y0 = max(0.0, sys_y0_raw - 2.5 * avg_unit)
++        sys_y1 = min(float(ih), sys_y1_raw + 2.5 * avg_unit)
++
++        sys_raw_staffs = [
++            st for st in all_staffs if (st.min_y >= sys_y0_raw - avg_unit and st.max_y <= sys_y1_raw + avg_unit)
++        ] or list(ms.staffs)
++
++        raw_bars: list[tuple[float, float]] = []
++        for bl in bar_line_boxes:
++            bx, by = float(bl.center[0]), float(bl.center[1])
++            bh = float(bl.size[1])
++            if sys_y0 <= by <= sys_y1 and (sys_x0 - 20.0) <= bx <= (sys_x1 + 20.0):
++                raw_bars.append((bx, bh))
++        raw_bars.sort(key=lambda t: t[0])
++
++        cluster_tol = max(18.0, 3.5 * avg_unit)
++        clusters: list[list[tuple[float, float]]] = []
++        for bx, bh in raw_bars:
++            if not clusters or (bx - clusters[-1][-1][0]) > cluster_tol:
++                clusters.append([(bx, bh)])
++            else:
++                clusters[-1].append((bx, bh))
++
++        clustered_x: list[float] = []
++        for cl in clusters:
++            mean_x = sum(x for x, _ in cl) / len(cl)
++            total_h = sum(h for _, h in cl)
++            if len(cl) >= 2 or total_h >= 5.5 * avg_unit or abs(mean_x - sys_x1) <= 40.0:
++                clustered_x.append(mean_x)
++
++        min_m_width = max(55.0, 8.0 * avg_unit)
++        if not clustered_x or (clustered_x[0] - sys_x0) > min_m_width:
++            clustered_x.insert(0, sys_x0)
++        else:
++            clustered_x[0] = sys_x0
++        if (sys_x1 - clustered_x[-1]) > min_m_width:
++            clustered_x.append(sys_x1)
++        else:
++            clustered_x[-1] = sys_x1
++
++        for k in range(len(clustered_x) - 1):
++            mx0, mx1 = clustered_x[k], clustered_x[k + 1]
++            if (mx1 - mx0) >= min_m_width:
++                s_boxes = [
++                    {
++                        "x": float(max(0.0, min(1.0, round(mx0 / iw, 6)))),
++                        "y": float(max(0.0, min(1.0, round(float(st.min_y) / ih, 6)))),
++                        "w": float(max(0.0, min(1.0, round((mx1 - mx0) / iw, 6)))),
++                        "h": float(max(0.0, min(1.0, round(float(st.max_y - st.min_y) / ih, 6)))),
++                    }
++                    for st in sys_raw_staffs
++                ]
++                measure_boxes.append(
++                    {
++                        "measure_index": global_m_idx,
++                        "system_index": sys_idx,
++                        "x": float(max(0.0, min(1.0, round(mx0 / iw, 6)))),
++                        "y": float(max(0.0, min(1.0, round(sys_y0 / ih, 6)))),
++                        "w": float(max(0.0, min(1.0, round((mx1 - mx0) / iw, 6)))),
++                        "h": float(max(0.0, min(1.0, round((sys_y1 - sys_y0) / ih, 6)))),
++                        "staff_boxes": s_boxes,
++                    }
++                )
++                global_m_idx += 1
++
++    boxes_file = replace_extension(image_path, ".boxes.json")
++    with open(boxes_file, "w", encoding="utf-8") as f:
++        json.dump(
 +            {
-+                "staff_spacing_px": float(staff_spacing_px),
++                "staff_spacing_px": round(page_unit, 2),
 +                "measure_boxes": measure_boxes,
 +            },
++            f,
 +            indent=2,
-+        ),
-+        encoding="utf-8",
++        )
++
++
++def detect_staffs_in_image(
++    image_path: str, config: ProcessingConfig
++) -> tuple[list[MultiStaff], NDArray, Debug, Future[str]]:
+     predictions, debug = load_and_preprocess_predictions(
+         image_path, config.enable_debug, config.enable_cache, config.segnet_use_gpu
+     )
+@@ -285,6 +389,9 @@
+         "Found",
+         len(multi_staffs),
+         "connected staffs (after merging grand staffs, multiple voices): ",
++        [len(staff.staffs) for staff in multi_staffs],
 +    )
++
+     _export_normalized_measure_boxes(
+         image_path, multi_staffs, staffs, bar_line_boxes, predictions.preprocessed.shape
+     )

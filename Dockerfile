@@ -24,7 +24,10 @@ RUN pip install --no-cache-dir \
     python -c "import homr"
 
 COPY LICENSE README.md /app/
+COPY patches/ /app/patches/
 COPY omr_homr_service/ /app/omr_homr_service/
+
+RUN patch -p1 -d "$(python -c 'import homr, pathlib; print(pathlib.Path(homr.__file__).parent.parent)')" < /app/patches/export_measure_boxes.patch
 
 RUN chown -R appuser:appuser /app
 USER appuser
